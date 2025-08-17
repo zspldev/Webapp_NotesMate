@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NotesMate</title>
+    <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.development.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.development.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.20.15/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .section { display: none; }
+        .section.active { display: block; }
+        .recording { background-color: #ef4444; color: white; }
+        .loader { border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; width: 24px; height: 24px; animation: spin 1s linear infinite; display: inline-block; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body class="bg-gray-100 font-sans">
+    <div id="root" class="container mx-auto p-4 max-w-2xl"></div>
+    <script type="text/babel">
+        console.log("Script loaded at", new Date().toISOString());
+
+        const BACKEND_URL = "https://transcript-backend-j66i04p3j-megamind1212s-projects.vercel.app/";
+        const DEEPGRAM_API_KEY = "32683910a62128aacbef2a8e7710d94c77a46101";
+        const DEEPGRAM_WS_URL = "wss://api.deepgram.com/v1/listen?model=nova-3-medical&diarize=true&smart_format=true&punctuate=true";
+
+        function formatForDisplay(dateTime) {
+            const dt = new Date(dateTime + 'Z');
+            dt.setUTCMinutes(dt.getUTCMinutes() + 330);
+            const utcDate = new Date(dateTime + 'Z');
+            const date = utcDate.toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric' }).split('/').join('-');
+            const hours = dt.getUTCHours();
+            const minutes = dt.getUTCMinutes();
+            const seconds = dt.getUTCSeconds();
+            const microseconds = dateTime.split('.')[1] || '000000';
+            const ampm = hours >= 12 ? 'PM' : 'AM';
+            const displayHours = hours % 12 || 12;
+            return { date: `Date: ${date}`, time: `Time: ${displayHours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}.${microseconds} ${ampm} IST` };
+        }
+
+        function App() {
+            const [currentSection, setCurrentSection] = React.useState("welcome");
+            const [orgId, setOrgId] = React.useState("");
+            const [empId, setEmpId] = React.useState("");
+            const [clientId, setClientId] = React.useState("");
+            const [isRecording, setIsRecording] = React.useState(false);
+            const [transcription, setTranscription] = React.useState("");
+            const [audioData, setAudioData] = React.useState(null);
+            const [clients, setClients] = React.useState([]);
+            const [notes, setNotes] = React.useState([]);
+            const [otp, setOtp] = React.useState("");
+            const [message, setMessage] = React.useState("");
+            const [error, setError] = React.useState("");
+            const [isLoading, setIsLoading] = React.useState(false);
+
+            let mediaRecorder = React.useRef(null);
+            let socket = React.useRef(null);
+            let stream = React.useRef(null);
+            let audioChunks = React.useRef([]);
+
+            const showSection = (section) => {
+                setCurrentSection(section);
+                setError("");
+                setMessage("");
+            };
+
+            const requestOTP = async () => {
+                if (!orgId || !empId) {
+                    setError("Please enter both orgid and empid.");
+                    return;
+                }
+                setIsLoading(true);
+                const requestUrl = `${BACKEND_URL}api/request-otp`;
+                console.log("Attempting OTP request with URL:", requestUrl, "Method: POST", "Data:", { orgId: parseInt(orgId), empId: parseInt(empId) });
+                try {
+                    const response = await fetch(requestUrl, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ orgId: parseInt(orgId), empId: parseInt(empId) })
+                    });
+                    console.log("Response status:", response.status, "Headers:", Object.fromEntries(response.headers));
+                    const data = await response.json();
+                    console.log("Response data:", data);
+                    if (!response.ok) throw new Error(`HTTP error! Status: ${response.status}`);
+                    if (data.error) setError(data.error);
+                    else {
+                        setMessage(data.message);
+                        showSection("otp");
+                    }
+                } catch (err) {
+                    console.error("Fetch error:", err.message, "Details:", err);
+                    setError(`Error requesting OTP: ${err.message}`);
+                } finally {
+                    setIsLoading(false);
+                }
+            };
+
+            const validateOTP = async () => {
+                if (!otp) {
+                    setError("Please enter the OTP.");
+                    return;
+                }
+                try {
+                    const response = await fetch(`${BACKEND_URL}api/validate-otp`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ orgId: parseInt(orgId), empId: parseInt(empId), otp })
+                    });
+                    if (!response.ok) throw new Error(`HTTP error! Status: ${response.status}`);
+                    const data = await response.json();
+                    if (data.error) setError(data.error);
+                    else {
+                        setMessage(data.message);
+                        showSection("transcription");
+                    }
+                } catch (err) {
+                    console.error("Fetch error:", err.message, "Details:", err);
+                    setError(`Error validating OTP: ${err.message}`);
+                }
+            };
+
+            const skipLogin = () => {
+                if (!orgId || !empId) {
+                    setError("Please enter both orgid and empid.");
+                    return;
+                }
+                setMessage("Skipping OTP validation for now.");
+                showSection("transcription");
+            };
+
+            const fetchClients = async () => {
+                try {
+                    const response = await fetch(`${BACKEND_URL}api/fetch-clients`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ orgId: parseInt(orgId) })
+                    });
+                    if (!response.ok) throw new Error(`HTTP error! Status: ${response.status}`);
+                    const data = await response.json();
+                    if (data.error) setError(data.error);
+                    else setClients(data.clients);
+                } catch (err) {
+                    console.error("Fetch error:", err.message, "Details:", err);
+                    setError(`Error fetching clients: ${err.message}`);
+                }
+            };
+
+            const startRecording = async () => {
+                if (!clientId || clientId === "NEW") {
+                    showSection("client-selection");
+                    return;
+                }
+                audioChunks.current = [];
+                setTranscription("");
+                try {
+                    stream.current = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    mediaRecorder.current = new MediaRecorder(stream.current, { mimeType: "audio/webm" });
+                    socket.current = new WebSocket(DEEPGRAM_WS_URL, ["token", DEEPGRAM_API_KEY]);
+
+                    socket.current.onopen = () => {
+                        mediaRecorder.current.start(250);
+                        setIsRecording(true);
+                    };
+
+                    socket.current.onmessage = (event) => {
+                        const data = JSON.parse(event.data);
+                        const transcript = data.channel?.alternatives?.[0]?.transcript;
+                        const words = data.channel?.alternatives?.[0]?.words || [];
+                        if (transcript && words.length > 0) {
+                            let newText = "";
+                            words.forEach(wordInfo => {
+                                const word = wordInfo.punctuated_word || wordInfo.word;
+                                newText += (newText ? " " : "") + word;
+                            });
+                            setTranscription(prev => prev + (prev ? " " : "") + newText.trim());
+                        }
+                    };
+
+                    socket.current.onerror = () => {
+                        stopRecording();
+                        setError("Error connecting to Deepgram. Check API key.");
+                    };
+
+                    mediaRecorder.current.ondataavailable = (event) => {
+                        if (event.data.size > 0) {
+                            audioChunks.current.push(event.data);
+                            if (socket.current.readyState === WebSocket.OPEN) socket.current.send(event.data);
+                        }
+                    };
+
+                    mediaRecorder.current.onstop = () => {
+                        const audioBlob = new Blob(audioChunks.current, { type: "audio/webm" });
+                        const reader = new FileReader();
+                        reader.readAsDataURL(audioBlob);
+                        reader.onloadend = () => {
+                            setAudioData(reader.result.split(",")[1]);
+                        };
+                    };
+                } catch (err) {
+                    setError(`Microphone error: ${err.message}`);
+                }
+            };
+
+            const stopRecording = () => {
+                if (mediaRecorder.current && mediaRecorder.current.state !== "inactive") {
+                    mediaRecorder.current.stop();
+                    stream.current.getTracks().forEach(track => track.stop());
+                }
+                if (socket.current && socket.current.readyState === WebSocket.OPEN) socket.current.close();
+                setIsRecording(false);
+            };
+
+            const saveTranscription = async () => {
+                if (!orgId || !empId || !clientId) {
+                    setError("Please login and select a client.");
+                    return;
+                }
+                if (!transcription) {
+                    setError("No transcription data to save.");
+                    return;
+                }
+                try {
+                    const response = await fetch(`${BACKEND_URL}api/save-transcription`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            orgId: parseInt(orgId),
+                            empId: parseInt(empId),
+                            clientId: parseInt(clientId),
+                            transcriptionText: transcription,
+                            audioData
+                        })
+                    });
+                    if (!response.ok) throw new Error(`HTTP error! Status: ${response.status}`);
+                    const data = await response.json();
+                    if (data.error) setError(data.error);
+                    else setMessage("Transcription saved successfully for client!");
+                } catch (err) {
+                    console.error("Fetch error:", err.message, "Details:", err);
+                    setError(`Error saving transcription: ${err.message}`);
+                }
+            };
+
+            const fetchNotes = async () => {
+                const selectedDate = document.getElementById("records-date")?.value;
+                if (!orgId || !empId || !clientId) {
+                    setError("Enter orgid, empid, and select a clientid.");
+                    return;
+                }
+                try {
+                    const response = await fetch(`${BACKEND_URL}api/fetch-notes`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            orgId: parseInt(orgId),
+                            empId: parseInt(empId),
+                            clientId: parseInt(clientId),
+                            selectedDate: selectedDate || null
+                        })
+                    });
+                    if (!response.ok) throw new Error(`HTTP error! Status: ${response.status}`);
+                    const data = await response.json();
+                    console.log("Fetched notes data:", data);
+                    if (data.error) setError(data.error);
+                    else {
+                        const formattedNotes = data.notes.map(note => {
+                            const { date, time } = formatForDisplay(note.DateTime);
+                            return {
+                                ...note,
+                                displayDate: date,
+                                displayTime: time,
+                                DateTime: note.DateTime
+                            };
+                        });
+                        setNotes(formattedNotes);
+                    }
+                } catch (err) {
+                    console.error("Fetch error:", err.message, "Details:", err);
+                    setError(`Error fetching notes: ${err.message}`);
+                }
+            };
+
+            const updateNote = async (dateTime, newText) => {
+                try {
+                    const response = await fetch(`${BACKEND_URL}api/update-note`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            orgId: parseInt(orgId),
+                            empId: parseInt(empId),
+                            clientId: parseInt(clientId),
+                            dateTime: dateTime,
+                            newText
+                        })
+                    });
+                    if (!response.ok) throw new Error(`HTTP error! Status: ${response.status}`);
+                    const data = await response.json();
+                    if (data.error) setError(data.error);
+                    else {
+                        setMessage(data.message);
+                        fetchNotes();
+                    }
+                } catch (err) {
+                    console.error("Fetch error:", err.message, "Details:", err);
+                    setError(`Error updating note: ${err.message}`);
+                }
+            };
+
+            const registerUser = async (e) => {
+                e.preventDefault();
+                const formData = new FormData(e.target);
+                const data = {
+                    orgId: parseInt(formData.get("orgId")),
+                    orgName: formData.get("orgName"),
+                    shortname: formData.get("shortname"),
+                    address: formData.get("address"),
+                    orgPhone: formData.get("orgPhone"),
+                    orgEmail: formData.get("orgEmail"),
+                    empId: parseInt(formData.get("empId")),
+                    empName: formData.get("empName"),
+                    empShortname: formData.get("empShortname"),
+                    empPhone: formData.get("empPhone"),
+                    empEmail: formData.get("empEmail")
+                };
+                if (!data.orgId || !data.orgName || !data.shortname || !data.address || !data.orgPhone || !data.orgEmail || !data.empId || !data.empName || !data.empShortname || !data.empPhone || !data.empEmail) {
+                    setError("Please fill in all fields.");
+                    return;
+                }
+                if (!data.empPhone.match(/\+91[0-9]{10}/)) {
+                    setError("Employee phone must be in the format +91 followed by 10 digits.");
+                    return;
+                }
+                try {
+                    const response = await fetch(`${BACKEND_URL}api/register`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(data)
+                    });
+                    if (!response.ok) throw new Error(`HTTP error! Status: ${response.status}`);
+                    const result = await response.json();
+                    if (result.error) setError(result.error);
+                    else {
+                        setMessage("Registration successful! You can now log in.");
+                        showSection("welcome");
+                    }
+                } catch (err) {
+                    console.error("Fetch error:", err.message, "Details:", err);
+                    setError(`Error during registration: ${err.message}`);
+                }
+            };
+
+            const registerClient = async (e) => {
+                e.preventDefault();
+                const formData = new FormData(e.target);
+                const data = {
+                    orgId: parseInt(orgId),
+                    clientName: formData.get("clientName"),
+                    clientShortname: null,
+                    clientPhone: formData.get("clientPhone") || "NA",
+                    clientEmail: formData.get("clientEmail"),
+                    foreignKey: formData.get("foreignKey") || "X"
+                };
+                console.log("Register Client Request Body:", data);
+                if (!data.clientName || !data.clientEmail) {
+                    setError("Please fill in required fields: client name and email.");
+                    return;
+                }
+                if (data.clientPhone !== "NA" && !data.clientPhone.match(/\+91[0-9]{10}/)) {
+                    setError("If provided, client phone must be in the format +91 followed by 10 digits.");
+                    return;
+                }
+                try {
+                    const response = await fetch(`${BACKEND_URL}api/register-client`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(data)
+                    });
+                    if (!response.ok) throw new Error(`HTTP error! Status: ${response.status}`);
+                    const result = await response.json();
+                    if (result.error) setError(result.error);
+                    else {
+                        setClientId(result.clientId);
+                        setMessage(result.message);
+                        fetchClients();
+                        showSection("transcription");
+                        startRecording(); // Start recording automatically after client selection
+                    }
+                } catch (err) {
+                    console.error("Fetch error:", err.message, "Details:", err);
+                    setError(`Error registering client: ${err.message}`);
+                }
+            };
+
+            React.useEffect(() => {
+                if (currentSection === "client-selection" || currentSection === "records") {
+                    fetchClients();
+                }
+            }, [currentSection]);
+
+            return (
+                <div>
+                    {error && <div className="bg-red-100 text-red-700 p-2 mb-4 rounded">{error}</div>}
+                    {message && <div className="bg-green-100 text-green-700 p-2 mb-4 rounded">{message}</div>}
+                    
+                    <div id="welcome" className={`section ${currentSection === "welcome" ? "active" : ""}`}>
+                        <h1 className="text-2xl font-bold mb-4">Welcome to NotesMate</h1>
+                        <button onClick={() => showSection("login")} className="bg-blue-500 text-white px-4 py-2 rounded mr-2">Login</button>
+                        <button onClick={() => showSection("register")} className="bg-green-500 text-white px-4 py-2 rounded">Register</button>
+                    </div>
+
+                    <div id="login" className={`section ${currentSection === "login" ? "active" : ""}`}>
+                        <h2 className="text-xl font-bold mb-6">Login</h2>
+                        <div className="space-y-4">
+                            <input type="number" placeholder="Org ID" value={orgId} onChange={(e) => setOrgId(e.target.value)} className="border p-2 w-full rounded" />
+                            <input type="number" placeholder="Emp ID" value={empId} onChange={(e) => setEmpId(e.target.value)} className="border p-2 w-full rounded" />
+                            <div className="flex flex-col sm:flex-row gap-4">
+                                <button onClick={requestOTP} disabled={isLoading} className={`bg-blue-500 text-white px-4 py-2 rounded flex items-center ${isLoading ? "opacity-50 cursor-not-allowed" : ""}`}>
+                                    {isLoading ? <span className="loader mr-2"></span> : null}
+                                    Request OTP
+                                </button>
+                                <button onClick={skipLogin} className="bg-yellow-500 text-white px-4 py-2 rounded">Skip for Now</button>
+                                <button onClick={() => showSection("welcome")} className="bg-gray-500 text-white px-4 py-2 rounded">Back</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="otp" className={`section ${currentSection === "otp" ? "active" : ""}`}>
+                        <h2 className="text-xl font-bold mb-4">Enter OTP</h2>
+                        <input type="text" placeholder="OTP" value={otp} onChange={(e) => setOtp(e.target.value)} className="border p-2 mb-2 w-full rounded" />
+                        <button onClick={validateOTP} className="bg-blue-500 text-white px-4 py-2 rounded">Validate OTP</button>
+                        <button onClick={() => showSection("login")} className="bg-gray-500 text-white px-4 py-2 rounded ml-2">Back</button>
+                    </div>
+
+                    <div id="register" className={`section ${currentSection === "register" ? "active" : ""}`}>
+                        <h2 className="text-xl font-bold mb-4">Register</h2>
+                        <form onSubmit={registerUser}>
+                            <input name="orgId" type="number" placeholder="Org ID" className="border p-2 mb-2 w-full rounded" />
+                            <input name="orgName" type="text" placeholder="Org Name" className="border p-2 mb-2 w-full rounded" />
+                            <input name="shortname" type="text" placeholder="Org Shortname" className="border p-2 mb-2 w-full rounded" />
+                            <input name="address" type="text" placeholder="Address" className="border p-2 mb-2 w-full rounded" />
+                            <input name="orgPhone" type="text" placeholder="Org Phone (+91...)" className="border p-2 mb-2 w-full rounded" />
+                            <input name="orgEmail" type="email" placeholder="Org Email" className="border p-2 mb-2 w-full rounded" />
+                            <input name="empId" type="number" placeholder="Emp ID" className="border p-2 mb-2 w-full rounded" />
+                            <input name="empName" type="text" placeholder="Emp Name" className="border p-2 mb-2 w-full rounded" />
+                            <input name="empShortname" type="text" placeholder="Emp Shortname" className="border p-2 mb-2 w-full rounded" />
+                            <input name="empPhone" type="text" placeholder="Emp Phone (+91...)" className="border p-2 mb-2 w-full rounded" />
+                            <input name="empEmail" type="email" placeholder="Emp Email" className="border p-2 mb-2 w-full rounded" />
+                            <button type="submit" className="bg-green-500 text-white px-4 py-2 rounded">Register</button>
+                            <button type="button" onClick={() => showSection("welcome")} className="bg-gray-500 text-white px-4 py-2 rounded ml-2">Back</button>
+                        </form>
+                    </div>
+
+                    <div id="client-selection" className={`section ${currentSection === "client-selection" ? "active" : ""}`}>
+                        <h2 className="text-xl font-bold mb-4">Select Client</h2>
+                        <select id="client-select" onChange={(e) => {
+                            if (e.target.value === "NEW") showSection("client-register");
+                            else setClientId(e.target.value);
+                        }} className="border p-2 mb-2 w-full rounded">
+                            <option value="">Select a client</option>
+                            <option value="NEW">NEW - Register New Client</option>
+                            {clients.map(client => (
+                                <option key={client.ClientID} value={client.ClientID}>
+                                    {client.ClientName} ({client.ClientShortname})
+                                </option>
+                            ))}
+                        </select>
+                        <button onClick={() => {
+                            if (!clientId || clientId === "NEW") {
+                                setError("Please select a valid client or register a new one.");
+                                showSection("client-register");
+                            } else {
+                                showSection("transcription");
+                                startRecording(); // Start recording after client selection
+                            }
+                        }} className="bg-blue-500 text-white px-4 py-2 rounded">Proceed to Record</button>
+                        <button onClick={() => showSection("transcription")} className="bg-gray-500 text-white px-4 py-2 rounded ml-2">Back</button>
+                    </div>
+
+                    <div id="client-register" className={`section ${currentSection === "client-register" ? "active" : ""}`}>
+                        <h2 className="text-xl font-bold mb-4">Register Client</h2>
+                        <form onSubmit={registerClient}>
+                            <input name="clientName" type="text" placeholder="Client Name" className="border p-2 mb-2 w-full rounded" required />
+                            <input name="foreignKey" type="text" placeholder="Foreign Key" maxLength="16" className="border p-2 mb-2 w-full rounded" />
+                            <input name="clientPhone" type="text" placeholder="Client Phone (+91...) (optional)" className="border p-2 mb-2 w-full rounded" />
+                            <input name="clientEmail" type="email" placeholder="Client Email" className="border p-2 mb-2 w-full rounded" required />
+                            <input type="hidden" name="orgId" value={orgId} />
+                            <button type="submit" className="bg-green-500 text-white px-4 py-2 rounded">Register Client</button>
+                            <button type="button" onClick={() => showSection("client-selection")} className="bg-gray-500 text-white px-4 py-2 rounded ml-2">Back</button>
+                        </form>
+                    </div>
+
+                    <div id="transcription" className={`section ${currentSection === "transcription" ? "active" : ""}`}>
+                        <h2 className="text-xl font-bold mb-4">Consultation Transcription</h2>
+                        <button
+                            onClick={() => {
+                                if (!isRecording) {
+                                    startRecording();
+                                } else {
+                                    stopRecording();
+                                }
+                            }}
+                            className={`px-4 py-2 rounded ${isRecording ? "bg-red-500 text-white" : "bg-blue-500 text-white"}`}
+                            title={isRecording ? "Stop recording" : "Start recording"}
+                        >
+                            {isRecording ? "Stop 🎙️" : "Start 🎙️"}
+                        </button>
+                        <button
+                            onClick={saveTranscription}
+                            disabled={!transcription || isRecording}
+                            className={`px-4 py-2 rounded ml-2 ${!transcription || isRecording ? "bg-gray-400 text-white cursor-not-allowed" : "bg-green-500 text-white"}`}
+                        >
+                            Save Transcription 💾
+                        </button>
+                        <div className="border p-4 mt-4 rounded min-h-[100px] overflow-y-auto">
+                            {transcription.length === 0 ? (
+                                <p>{isRecording ? "Recording… Speak clearly." : "No transcription yet."}</p>
+                            ) : (
+                                <p>{transcription}</p>
+                            )}
+                        </div>
+                        <button onClick={() => {
+                            setOrgId("");
+                            setEmpId("");
+                            setClientId("");
+                            setTranscription("");
+                            setAudioData(null);
+                            showSection("welcome");
+                        }} className="bg-red-500 text-white px-4 py-2 rounded mt-2">Logout</button>
+                        <button onClick={() => {
+                            setNotes([]);
+                            showSection("records");
+                        }} className="bg-blue-500 text-white px-4 py-2 rounded mt-2 ml-2">See Records</button>
+                        <button onClick={() => {
+                            const prevClientId = clientId;
+                            showSection("client-selection");
+                            setClientId(prevClientId); // Preserve current clientId for selection
+                        }} className="bg-blue-500 text-white px-4 py-2 rounded mt-2 ml-2">Select Client</button>
+                    </div>
+
+                    <div id="records" className={`section ${currentSection === "records" ? "active" : ""}`}>
+                        <h2 className="text-xl font-bold mb-4">View Records</h2>
+                        <input id="records-orgid" type="number" placeholder="Org ID" value={orgId} onChange={(e) => setOrgId(e.target.value)} className="border p-2 mb-2 w-full rounded" />
+                        <input id="records-empid" type="number" placeholder="Emp ID" value={empId} onChange={(e) => setEmpId(e.target.value)} className="border p-2 mb-2 w-full rounded" />
+                        <select id="records-clientid" onChange={(e) => setClientId(e.target.value)} className="border p-2 mb-2 w-full rounded">
+                            <option value="">Select a client</option>
+                            {clients.map(client => (
+                                <option key={client.ClientID} value={client.ClientID}>
+                                    {client.ClientName} ({client.ClientShortname})
+                                </option>
+                            ))}
+                        </select>
+                        <label className="block mb-2">yyyy-mm-dd (Optional)</label>
+                        <input id="records-date" type="date" className="border p-2 mb-2 w-full rounded" />
+                        <button onClick={fetchNotes} className="bg-blue-500 text-white px-4 py-2 rounded">Fetch Records</button>
+                        <button onClick={() => showSection("transcription")} className="bg-gray-500 text-white px-4 py-2 rounded ml-2">Back</button>
+                        <div id="records-display" className="mt-4">
+                            {notes.length === 0 ? (
+                                <p>No records found.</p>
+                            ) : (
+                                notes.map((note, index) => (
+                                    <div key={index} className="border p-4 mb-2 rounded">
+                                        <p><strong>{note.displayDate}</strong><br /><strong>{note.displayTime}</strong></p>
+                                        <p
+                                            contentEditable={false}
+                                            onBlur={(e) => {
+                                                if (e.target.getAttribute("contentEditable") === "true") {
+                                                    e.target.setAttribute("contentEditable", "false");
+                                                    updateNote(note.DateTime, e.target.innerText);
+                                                }
+                                            }}
+                                        >
+                                            <strong>Transcription:</strong><br/>{note.TextNotes.split("\n").map((line, i) => (
+                                                <span key={i}>{line}<br/></span>
+                                            ))}
+                                        </p>
+                                        {note.AudioNotes && (
+                                            <audio controls src={`data:audio/webm;base64,${note.AudioNotes}`} className="mt-2"></audio>
+                                        )}
+                                        <button
+                                            onClick={(e) => {
+                                                const p = e.target.previousSibling.previousSibling;
+                                                const isEditable = p.getAttribute("contentEditable") === "true";
+                                                p.setAttribute("contentEditable", !isEditable);
+                                                e.target.textContent = !isEditable ? "💾" : "✏️";
+                                                if (!isEditable) {
+                                                    updateNote(note.DateTime, p.innerText);
+                                                }
+                                            }}
+                                            className="bg-blue-500 text-white px-2 py-1 rounded mt-2"
+                                        >
+                                            ✏️
+                                        </button>
+                                    </div>
+                                ))
+                            )} 
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById("root"));
+        root.render(<App />);
+    </script>
+</body>
+</html>
